@@ -36,6 +36,17 @@ const state = {
   // nothing selected, the strike itself with exactly one selected: only
   // consulted when 2+ distinct strikes are selected, via the picker.
   straddleFocusStrike: null,
+
+  // -- Date/Session selector (historical replay) --------------------------
+  // "live" (today, websocket-driven, unchanged existing behavior) or
+  // "historical" (a past Asia/Kolkata trading date, read-only, no live
+  // ticks applied — see handleSnapshot()'s early-return guard).
+  sessionMode: "live",
+  todayIso: null, // "YYYY-MM-DD" in Asia/Kolkata, from GET /api/history/dates
+  selectedDateIso: null,
+  availableDates: [], // dates with persisted data, for "skip to nearest" UX
+  historicalSession: null, // last-fetched GET /api/history/session bundle
+  historicalStrike: null, // strike currently shown in the historical Straddle Chart
 };
 
 const els = {
@@ -147,6 +158,18 @@ const els = {
   settingsRiskForm: document.getElementById("settings-risk-form"),
   settingsBasisForm: document.getElementById("settings-basis-form"),
   settingsStatus: document.getElementById("settings-status"),
+  // Date/Session selector
+  sessionBar: document.getElementById("session-bar"),
+  sessionPrevBtn: document.getElementById("session-prev-btn"),
+  sessionDatePicker: document.getElementById("session-date-picker"),
+  sessionNextBtn: document.getElementById("session-next-btn"),
+  sessionTodayBtn: document.getElementById("session-today-btn"),
+  sessionModeBadge: document.getElementById("session-mode-badge"),
+  sessionNoData: document.getElementById("session-no-data"),
+  historicalAtmPanel: document.getElementById("historical-atm-panel"),
+  historicalAtmBody: document.getElementById("historical-atm-body"),
+  historicalStrikeSelect: document.getElementById("historical-strike-select"),
+  appRoot: document.querySelector(".app"),
 };
 
 // Shown wherever an expiry field has nothing valid to display — never
@@ -169,10 +192,32 @@ function fmt(value, digits = 2) {
   });
 }
 
+// Every timestamp from the backend is an IST-offset ISO string (see
+// src/timeutil.py / serializers.py::_dt). Pinning timeZone here too means
+// display is always Asia/Kolkata regardless of the browser's own locale or
+// system timezone — never "server/browser local time".
+const IST_TIMEZONE = "Asia/Kolkata";
+
 function fmtTime(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
-  return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return d.toLocaleTimeString("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: IST_TIMEZONE,
+  });
+}
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: IST_TIMEZONE,
+  });
 }
 
 function fmtSigned(value, digits = 2) {
@@ -1497,10 +1542,340 @@ function bindSettings() {
 }
 
 // ---------------------------------------------------------------------------
+// Date/Session selector — Today vs. a past Asia/Kolkata trading date.
+// "live" reuses the existing websocket-driven pipeline unchanged; picking a
+// past date switches into "historical" mode: a single read-only fetch from
+// GET /api/history/session, rendered through the same chart/table renderers
+// used above, with all trading actions visually disabled (see
+// ".app.is-historical" in styles.css) and every subsequent live tick ignored
+// (see handleSnapshot()'s early-return guard).
+// ---------------------------------------------------------------------------
+
+// Today's Asia/Kolkata calendar date as "YYYY-MM-DD". The "en-CA" locale
+// formats as ISO by construction; passing `timeZone` explicitly (not relying
+// on the browser's own zone) is what keeps this correct regardless of where
+// the browser happens to be running — same principle as fmtTime()/fmtDate().
+function todayIsoIST() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: IST_TIMEZONE });
+}
+
+// Trading dates that can actually be navigated to: every persisted date
+// (state.availableDates, from GET /api/history/dates) plus today — today is
+// always navigable since it's live MOCK data, whether or not anything has
+// been persisted for it yet. Sorted ascending.
+function getNavigableDates() {
+  const set = new Set(state.availableDates || []);
+  if (state.todayIso) set.add(state.todayIso);
+  return [...set].sort();
+}
+
+// Nearest persisted/navigable date strictly before `iso`, or null if there
+// is none — this is the actual "skip empty dates" behavior: Previous Day
+// jumps straight to the last date that has data, not just iso-1.
+function previousAvailableDate(iso) {
+  let prev = null;
+  for (const d of getNavigableDates()) {
+    if (d < iso) prev = d;
+    else break;
+  }
+  return prev;
+}
+
+// Nearest persisted/navigable date strictly after `iso`, or null if there
+// is none.
+function nextAvailableDate(iso) {
+  for (const d of getNavigableDates()) {
+    if (d > iso) return d;
+  }
+  return null;
+}
+
+// A date typed/picked directly (the date-picker input) might land on a day
+// with no data — snap to the nearest available one instead of showing an
+// empty historical view: prefer the nearest earlier date, then the nearest
+// later one, then fall back to today.
+function snapToAvailableDate(iso) {
+  const dates = getNavigableDates();
+  if (dates.includes(iso)) return iso;
+  return previousAvailableDate(iso) || nextAvailableDate(iso) || state.todayIso;
+}
+
+function setSessionMode(mode) {
+  state.sessionMode = mode;
+  els.appRoot.classList.toggle("is-historical", mode === "historical");
+  els.historicalAtmPanel.classList.toggle("hidden", mode !== "historical");
+  els.historicalStrikeSelect.classList.toggle("hidden", mode !== "historical");
+
+  if (mode === "live") {
+    els.sessionModeBadge.textContent = "● LIVE";
+    els.sessionModeBadge.className = "session-mode-badge session-mode-live";
+  } else {
+    els.sessionModeBadge.textContent = "◼ HISTORICAL (READ-ONLY)";
+    els.sessionModeBadge.className = "session-mode-badge session-mode-historical";
+    // The 2+ selected-strikes picker is part of the live Multi-Strike
+    // Selection system (state.multiSelected) — not meaningful historically;
+    // the Straddle Chart's own historicalStrikeSelect takes over instead.
+    els.straddleModeChip.classList.add("hidden");
+    els.straddleFocusSelect.classList.add("hidden");
+    if (els.simBanner) els.simBanner.classList.add("hidden");
+  }
+}
+
+function updateSessionNavButtons() {
+  const iso = state.selectedDateIso;
+  els.sessionPrevBtn.disabled = !iso || previousAvailableDate(iso) == null;
+  els.sessionNextBtn.disabled = !iso || nextAvailableDate(iso) == null;
+  if (iso) els.sessionDatePicker.value = iso;
+  if (state.todayIso) els.sessionDatePicker.max = state.todayIso;
+}
+
+async function loadAvailableDates() {
+  try {
+    const res = await fetch("/api/history/dates");
+    const data = await res.json();
+    state.todayIso = data.today || todayIsoIST();
+    state.availableDates = data.dates || [];
+  } catch (err) {
+    console.error("Failed to load available trading dates", err);
+    state.todayIso = state.todayIso || todayIsoIST();
+  }
+  if (!state.selectedDateIso) state.selectedDateIso = state.todayIso;
+  updateSessionNavButtons();
+}
+
+function reshapeHistoricalCandles(candlesByInterval) {
+  const reshaped = {};
+  for (const [interval, series] of Object.entries(candlesByInterval || {})) {
+    reshaped[interval] = { active: null, completed: (series || []).slice(-20), series: series || [] };
+  }
+  return reshaped;
+}
+
+function renderHistoricalCandles(session) {
+  const reshaped = reshapeHistoricalCandles(session.candles);
+  updateCandlesPanel({ candles: reshaped });
+  updateChart({ candles: reshaped });
+}
+
+function renderHistoricalUnderlying(session) {
+  const u = session.underlying || {};
+  els.symbolTitle.textContent = u.symbol || "NIFTY";
+  els.spotPrice.textContent = fmt(u.close);
+  els.spotChange.textContent = "—";
+  els.spotChange.className = "spot-change neutral";
+  els.moLtp.textContent = fmt(u.close);
+  els.moChange.textContent = "—";
+  els.lastUpdated.textContent = u.last_updated
+    ? `Session ${fmtDate(u.last_updated)} · O ${fmt(u.open)} H ${fmt(u.high)} L ${fmt(u.low)} C ${fmt(u.close)}`
+    : "No data for this session";
+  els.moTimestamp.textContent = u.last_updated ? `Session close ${fmtTime(u.last_updated)}` : "—";
+  els.moTicks.textContent = "—";
+
+  els.connStatus.textContent = "HISTORICAL";
+  els.connStatus.className = "badge badge-simulated";
+  els.staleBadge.classList.add("hidden");
+  els.sessionBadge.textContent = "Historical Session";
+  els.sessionBadge.className = "badge badge-session";
+  els.tickReliability.textContent = "";
+  els.dataSource.textContent = "HISTORICAL (persisted)";
+  els.lastTickAge.textContent = "—";
+  els.tickCount.textContent = "—";
+}
+
+function renderHistoricalAtmSummary(session) {
+  const rows = session.option_chain_snapshots || [];
+  const last = rows[rows.length - 1];
+
+  els.atmStrike.textContent = last ? fmt(last.atm_strike, 0) : "—";
+  els.atmCall.textContent = last ? fmt(last.atm_call_ltp) : "—";
+  els.atmPut.textContent = last ? fmt(last.atm_put_ltp) : "—";
+  els.atmStraddle.textContent = last ? fmt(last.straddle_premium) : "—";
+  els.atmCallDelta.textContent = "—";
+  els.atmPutDelta.textContent = "—";
+  els.atmMethodChip.textContent = "Session close";
+  els.atmCompare.classList.add("hidden");
+  els.chainExpiry.textContent = fmtExpiry(last?.expiry);
+
+  // The full multi-strike Option Chain grid reflects live in-memory state
+  // and isn't persisted tick-by-tick (only ATM-focused snapshots are — see
+  // PersistenceStore.option_chain_snapshots); point at the ATM history table
+  // below instead of showing stale/misleading live rows.
+  els.optionChainBody.innerHTML =
+    `<tr><td colspan="8" class="empty">Historical session — full option chain replay isn't stored. See "Session ATM History" below for this day's recorded ATM strike/CE/PE, and the Straddle Chart for any persisted strike's own OHLC.</td></tr>`;
+
+  const tail = rows.slice(-100).reverse();
+  els.historicalAtmBody.innerHTML = tail.length
+    ? tail
+        .map(
+          (r) => `
+          <tr>
+            <td>${fmtTime(r.timestamp)}</td>
+            <td>${fmt(r.atm_strike, 0)}</td>
+            <td>${fmt(r.atm_call_ltp)}</td>
+            <td>${fmt(r.atm_put_ltp)}</td>
+            <td>${fmt(r.straddle_premium)}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5" class="empty">No data</td></tr>`;
+}
+
+function populateHistoricalStrikePicker(session) {
+  const strikes = session.available_strikes || [];
+  const focus = session.straddle_candles?.strike ?? state.historicalStrike ?? strikes[0] ?? null;
+  state.historicalStrike = focus;
+
+  if (strikes.length === 0) {
+    els.historicalStrikeSelect.innerHTML = "";
+    return;
+  }
+  els.historicalStrikeSelect.innerHTML = strikes
+    .map((s) => `<option value="${s}"${s === focus ? " selected" : ""}>${fmt(s, 0)}</option>`)
+    .join("");
+}
+
+function renderHistoricalStraddleChart(session) {
+  populateHistoricalStrikePicker(session);
+  const strike = state.historicalStrike;
+  els.straddleTrackedStrike.textContent = strike != null ? fmt(strike, 0) : "—";
+  els.straddleExpiry.textContent = fmtExpiry(session.option_chain_snapshots?.slice(-1)[0]?.expiry);
+  els.straddleCurrentChange.textContent = "—";
+  els.straddleCurrentChange.className = "spot-change neutral";
+
+  if (!session.straddle_candles) {
+    els.straddleCurrentValue.textContent = "—";
+    state.straddleCandleData = null;
+    return;
+  }
+  state.straddleCandleData = session.straddle_candles;
+  state.straddleLastFetchedStrike = session.straddle_candles.strike;
+  renderStraddleChart();
+
+  const bucket = session.straddle_candles.by_interval?.[state.straddleInterval];
+  const bars = bucket ? bucket[state.straddleView] : null;
+  const lastBar = bars && bars.length ? bars[bars.length - 1] : null;
+  els.straddleCurrentValue.textContent = lastBar ? fmt(lastBar.close) : "—";
+}
+
+// The historical counterpart of updatePaperTrading() — deliberately doesn't
+// touch state.knownHistoryIds/paperInitialized (those drive the live "TP/SL
+// hit" toast diffing) so switching between dates never fires a spurious
+// toast for a trade that's simply new to this session's history.
+function renderHistoricalPaperTrading(session) {
+  const pt = session.paper_trading || {};
+  renderOpenPositions([]); // a past, closed session never has open positions
+  renderHistory(pt.history || []);
+  renderTradeStats(pt.stats);
+  renderPnlSummary(pt.pnl_summary, []);
+}
+
+function renderHistoricalSession(session) {
+  renderHistoricalUnderlying(session);
+  renderHistoricalAtmSummary(session);
+  renderHistoricalCandles(session);
+  renderHistoricalStraddleChart(session);
+  renderHistoricalPaperTrading(session);
+}
+
+async function loadHistoricalSession(iso, strike) {
+  try {
+    const url = `/api/history/session?date=${encodeURIComponent(iso)}${
+      strike != null ? `&strike=${encodeURIComponent(strike)}` : ""
+    }`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to load session");
+    const session = await res.json();
+    state.historicalSession = session;
+    els.sessionNoData.classList.toggle("hidden", session.has_data);
+    renderHistoricalSession(session);
+  } catch (err) {
+    console.error("Failed to load historical session", err);
+    els.sessionNoData.classList.remove("hidden");
+  }
+}
+
+async function selectDate(iso) {
+  if (!iso) return;
+  state.selectedDateIso = iso;
+  updateSessionNavButtons();
+
+  if (state.todayIso && iso === state.todayIso) {
+    setSessionMode("live");
+    els.sessionNoData.classList.add("hidden");
+    if (els.simBanner) els.simBanner.classList.remove("hidden");
+    try {
+      const snapshot = await fetch("/api/snapshot").then((r) => r.json());
+      handleSnapshot(snapshot); // safe: sessionMode is already "live" here
+    } catch (err) {
+      console.error("Failed to load live snapshot", err);
+    }
+    return;
+  }
+
+  setSessionMode("historical");
+  await loadHistoricalSession(iso);
+}
+
+function bindSessionBar() {
+  // Previous/Next jump straight to the nearest trading date that actually
+  // has persisted data (re-fetching the date list first so a long-running
+  // session picks up dates that gained data after page load) — empty dates
+  // are never landed on, per the "skip it and find the previous/next
+  // available trading date" requirement.
+  els.sessionPrevBtn.addEventListener("click", async () => {
+    await loadAvailableDates();
+    const prev = previousAvailableDate(state.selectedDateIso);
+    if (prev) selectDate(prev);
+  });
+
+  els.sessionNextBtn.addEventListener("click", async () => {
+    await loadAvailableDates();
+    const next = nextAvailableDate(state.selectedDateIso);
+    if (next) selectDate(next);
+  });
+
+  els.sessionTodayBtn.addEventListener("click", () => {
+    if (state.todayIso) selectDate(state.todayIso);
+  });
+
+  els.sessionDatePicker.addEventListener("change", async (event) => {
+    if (!event.target.value) return;
+    await loadAvailableDates();
+    selectDate(snapToAvailableDate(event.target.value));
+  });
+
+  // Switches which persisted strike's CE/PE/Straddle candles the Straddle
+  // Chart shows within the already-loaded historical session — a lighter
+  // fetch than reloading the whole session bundle.
+  els.historicalStrikeSelect.addEventListener("change", async (event) => {
+    const strike = Number(event.target.value);
+    if (Number.isNaN(strike) || !state.selectedDateIso) return;
+    state.historicalStrike = strike;
+    try {
+      const res = await fetch(
+        `/api/straddle-candles?strike=${encodeURIComponent(strike)}&date=${encodeURIComponent(state.selectedDateIso)}`
+      );
+      if (!res.ok) return;
+      state.straddleCandleData = await res.json();
+      state.straddleLastFetchedStrike = strike;
+      renderStraddleChart();
+      els.straddleTrackedStrike.textContent = fmt(strike, 0);
+    } catch (err) {
+      console.error("Failed to load historical straddle candles", err);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot dispatch
 // ---------------------------------------------------------------------------
 
 function handleSnapshot(snapshot) {
+  // Historical dates are read-only — never let a live tick (websocket push
+  // or a stray poll) overwrite the frozen historical view. Live ticks keep
+  // arriving in the background regardless (the engine doesn't stop for a
+  // viewer looking at the past), they're just not applied to the UI here.
+  if (state.sessionMode === "historical") return;
   state.latestSnapshot = snapshot; // for instant re-renders outside the tick cadence (e.g. selection changes)
   els.symbolTitle.textContent = snapshot.underlying || "NIFTY";
   els.tickCount.textContent = snapshot.tick_count ?? 0;
@@ -1603,6 +1978,11 @@ function bindTabs() {
       tab.classList.toggle("active", tab === btn);
     });
 
+    if (state.sessionMode === "historical") {
+      if (state.historicalSession) renderHistoricalCandles(state.historicalSession);
+      return;
+    }
+
     fetch("/api/snapshot")
       .then((r) => r.json())
       .then(handleSnapshot)
@@ -1620,6 +2000,12 @@ async function bootstrap() {
   bindMultiSelect();
   bindLogs();
   bindSettings();
+  bindSessionBar();
+
+  state.todayIso = todayIsoIST();
+  state.selectedDateIso = state.todayIso;
+  setSessionMode("live");
+  await loadAvailableDates(); // may refine todayIso from the server's clock
 
   try {
     const snapshot = await fetch("/api/snapshot").then((r) => r.json());

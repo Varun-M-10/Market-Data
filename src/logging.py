@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from src.models import Candle, PriceTick
+from src.timeutil import now_ist
 
 # How many recent log entries the in-memory ring buffer keeps for the UI's
 # System Logs panel (`GET /api/logs`). Purely additive to the existing
@@ -51,7 +52,7 @@ class StructuredLogger:
         """Log a price tick in structured JSON format."""
         log_entry = {
             "event_type": "price_tick",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "data": {
                 "symbol": tick.symbol,
                 "price": tick.price,
@@ -67,7 +68,7 @@ class StructuredLogger:
         """Log a completed candle in structured JSON format."""
         log_entry = {
             "event_type": "candle_completed",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "data": {
                 "symbol": candle.symbol,
                 "interval_minutes": candle.interval_minutes,
@@ -89,7 +90,7 @@ class StructuredLogger:
         """Log ATM strike update in structured JSON format."""
         log_entry = {
             "event_type": "atm_update",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "data": atm_data,
             "metadata": metadata or {},
         }
@@ -102,7 +103,7 @@ class StructuredLogger:
         """Log calculated prices in structured JSON format."""
         log_entry = {
             "event_type": "calculated_prices",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "data": calculated,
             "metadata": metadata or {},
         }
@@ -113,7 +114,7 @@ class StructuredLogger:
         """Log an error in structured JSON format."""
         log_entry = {
             "event_type": "error",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "data": {
                 "error_type": type(error).__name__,
                 "error_message": str(error),
@@ -129,7 +130,7 @@ class StructuredLogger:
         """Log a system event in structured JSON format."""
         log_entry = {
             "event_type": "system_event",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
             "event": event,
             "data": data or {},
             "metadata": metadata or {},

@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime, tzinfo
 
 from src.candles import CandleAggregator
-from src.models import OptionChainSnapshot, PriceTick
+from src.models import Candle, OptionChainSnapshot, PriceTick
 
 LEGS = ("ce", "pe", "straddle")
 
@@ -53,17 +53,25 @@ class StrikeStraddleCandleEngine:
             self._builders[strike] = builders
         return builders
 
-    def process(self, chain: OptionChainSnapshot | None, timestamp: datetime) -> None:
-        """Feed one tick's worth of chain legs into every strike's aggregators."""
+    def process(self, chain: OptionChainSnapshot | None, timestamp: datetime) -> list[Candle]:
+        """Feed one tick's worth of chain legs into every strike's
+        aggregators; return any CE/PE/Straddle candles that just completed
+        (for the caller to persist — see MarketEngine._tick_worker)."""
         if chain is None:
-            return
+            return []
+        finalized: list[Candle] = []
         for leg in chain.strikes:
             builders = self._get_or_create(leg.strike)
-            builders["ce"].process_tick(PriceTick(symbol="CE", price=leg.call_ltp, timestamp=timestamp))
-            builders["pe"].process_tick(PriceTick(symbol="PE", price=leg.put_ltp, timestamp=timestamp))
-            builders["straddle"].process_tick(
+            finalized += builders["ce"].process_tick(
+                PriceTick(symbol="CE", price=leg.call_ltp, timestamp=timestamp)
+            )
+            finalized += builders["pe"].process_tick(
+                PriceTick(symbol="PE", price=leg.put_ltp, timestamp=timestamp)
+            )
+            finalized += builders["straddle"].process_tick(
                 PriceTick(symbol="STRADDLE", price=leg.call_ltp + leg.put_ltp, timestamp=timestamp)
             )
+        return finalized
 
     def has_strike(self, strike: float) -> bool:
         return strike in self._builders

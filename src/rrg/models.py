@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from src.timeutil import to_ist
+
 
 class RRGQuadrant(Enum):
     """RRG quadrants based on RS-Ratio and RS-Momentum."""
@@ -65,7 +67,7 @@ class RRGDataPoint:
             "rs_ratio": self.rs_ratio,
             "rs_momentum": self.rs_momentum,
             "quadrant": self.quadrant.value,
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": to_ist(self.timestamp).isoformat(),
             "option_ltp": self.option_ltp,
             "benchmark_ltp": self.benchmark_ltp,
         }
@@ -87,6 +89,6 @@ class RRGSnapshot:
             "benchmark_symbol": self.benchmark_symbol,
             "benchmark_ltp": self.benchmark_ltp,
             "timeframe": self.timeframe,
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": to_ist(self.timestamp).isoformat(),
             "data_points": [dp.to_dict() for dp in self.data_points],
         }

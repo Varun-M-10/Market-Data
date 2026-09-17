@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -93,11 +94,43 @@ async def history_option_chain(limit: int = 200) -> dict:
     return {"snapshots": engine.get_persisted_option_chain_snapshots(limit)}
 
 
+@app.get("/api/history/dates")
+async def history_dates() -> dict:
+    """Every Asia/Kolkata trading date with persisted data (newest first),
+    plus today's IST date — backs the Date/Session selector's Previous/Next/
+    date-picker navigation."""
+    return engine.get_available_trading_dates()
+
+
+@app.get("/api/history/session")
+async def history_session(date: str, strike: float | None = None) -> dict:
+    """
+    Read-only bundle for one past Asia/Kolkata trading date: underlying price
+    summary, candles (every configured interval), option chain snapshots
+    through the day, one strike's CE/PE/Straddle candles, and that day's
+    paper trading history/P&L. `has_data: false` (not an error) if nothing
+    was persisted for this date. `date` must be "YYYY-MM-DD".
+    """
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format.") from exc
+    return engine.get_historical_session(date, strike)
+
+
 @app.get("/api/straddle-candles")
-async def straddle_candles(strike: float) -> dict:
-    """CE/PE/Straddle OHLC candles (1m/5m/15m) for one strike — the ATM
-    Straddle Chart's candlestick data source. 404 until that strike has
-    appeared at least once in the live option chain."""
+async def straddle_candles(strike: float, date: str | None = None) -> dict:
+    """CE/PE/Straddle OHLC candles (1m/5m/15m) for one strike. With no `date`
+    (or `date` omitted), this is the live-tracked strike's in-memory series —
+    the ATM Straddle Chart's normal data source. With `date` ("YYYY-MM-DD"),
+    it instead reads that strike's persisted candles for a past Asia/Kolkata
+    trading session (read-only, no live ticks). 404 if that strike has no
+    data yet/for that date."""
+    if date is not None:
+        data = engine.get_persisted_strike_candles_for_date(strike, date)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"No candle data for strike {strike} on {date}")
+        return data
     data = engine.get_strike_straddle_candles(strike)
     if data is None:
         raise HTTPException(status_code=404, detail=f"No candle data yet for strike {strike}")

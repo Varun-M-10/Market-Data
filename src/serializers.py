@@ -4,10 +4,15 @@ from datetime import datetime
 
 from src.candles import CandleAggregator
 from src.models import ATMResult, Candle, OptionChainSnapshot, PriceTick
+from src.timeutil import to_ist
 
 
 def _dt(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    """Serialize a datetime to an IST-offset ISO string — the single point
+    where every timestamp sent to the frontend is normalized to Asia/Kolkata,
+    regardless of whether it arrived naive or aware, or from a server
+    process running in a different timezone."""
+    return to_ist(value).isoformat() if value else None
 
 
 def _ts(value: datetime) -> int:
@@ -99,6 +104,151 @@ def serialize_chain(chain: OptionChainSnapshot | None, atm_strike: float | None)
         "expiry_type": chain.expiry_type,  # Configurable expiry type
         "timestamp": _dt(chain.timestamp),
         "strikes": strikes,
+    }
+
+
+def serialize_persisted_candle(row: dict) -> dict:
+    """Shape a raw SQLite `candles` row (see PersistenceStore) into the same
+    dict shape serialize_candle() produces, so the frontend's existing chart/
+    table rendering can be reused unchanged for historical data. Persisted
+    rows are always completed candles."""
+    open_time = datetime.fromisoformat(row["open_time"])
+    return {
+        "symbol": row["symbol"],
+        "interval_minutes": row["interval_minutes"],
+        "open_time": _dt(open_time),
+        "close_time": _dt(datetime.fromisoformat(row["close_time"])),
+        "time": _ts(open_time),
+        "open": row["open"],
+        "high": row["high"],
+        "low": row["low"],
+        "close": row["close"],
+        "tick_count": row["tick_count"],
+        "is_complete": True,
+    }
+
+
+def _empty_paper_stats() -> dict:
+    return {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate_percent": 0.0,
+        "total_pnl": 0.0,
+        "average_win": 0.0,
+        "average_loss": 0.0,
+        "max_drawdown": 0.0,
+    }
+
+
+def _empty_pnl_summary() -> dict:
+    return {
+        "unrealized_pnl": 0.0,
+        "realized_pnl": 0.0,
+        "total_pnl": 0.0,
+        "total_pnl_percent": 0.0,
+        "buy_turnover": 0.0,
+        "sell_turnover": 0.0,
+        "total_turnover": 0.0,
+        "total_position_value": 0.0,
+        "open_position_count": 0,
+    }
+
+
+def serialize_persisted_paper_trade(row: dict) -> dict:
+    """Shape a raw SQLite `paper_trades` row into the same dict shape
+    PaperPosition.to_dict() produces (the subset the History table and toast
+    logic actually read), so frontend rendering is reused unchanged."""
+    entry_price = row["entry_price"]
+    exit_price = row["exit_price"]
+    quantity = row["quantity"]
+    return {
+        "id": row["id"],
+        "option_type": row["option_type"],
+        "side": row["side"],
+        "strike": row["strike"],
+        "quantity": quantity,
+        "entry_price": round(entry_price, 2) if entry_price is not None else None,
+        "exit_price": round(exit_price, 2) if exit_price is not None else None,
+        "entry_time": _dt(datetime.fromisoformat(row["entry_time"])) if row["entry_time"] else None,
+        "exit_time": _dt(datetime.fromisoformat(row["exit_time"])) if row["exit_time"] else None,
+        "exit_reason": row["exit_reason"],
+        "status": "EXITED",
+        "pnl": round(row["pnl"], 2) if row["pnl"] is not None else 0.0,
+        "pnl_percent": round(row["pnl_percent"], 2) if row["pnl_percent"] is not None else 0.0,
+        "unrealized_pnl": None,
+        "realized_pnl": round(row["pnl"], 2) if row["pnl"] is not None else 0.0,
+        "take_profit_percent": row["take_profit_percent"],
+        "stop_loss_percent": row["stop_loss_percent"],
+        "take_profit_amount": row["take_profit_amount"],
+        "stop_loss_amount": row["stop_loss_amount"],
+        "simulated": True,
+    }
+
+
+def summarize_persisted_paper_trades(trades: list[dict]) -> dict:
+    """The historical counterpart of PaperTradingEngine.to_state_dict():
+    closed-trade stats + portfolio P&L/turnover, computed straight from
+    persisted rows for one past trading date. There are no "open positions"
+    in a past, read-only session — every persisted trade is already closed,
+    so unrealized P&L and open position value are always zero here."""
+    history = [serialize_persisted_paper_trade(row) for row in reversed(trades)]
+
+    if not trades:
+        return {
+            "simulated": True,
+            "open_positions": [],
+            "history": history,
+            "stats": _empty_paper_stats(),
+            "pnl_summary": _empty_pnl_summary(),
+        }
+
+    pnls = [row["pnl"] or 0.0 for row in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    total_pnl = sum(pnls)
+
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for p in pnls:
+        cumulative += p
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+
+    stats = {
+        "total_trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_percent": round((len(wins) / len(trades)) * 100.0, 2) if trades else 0.0,
+        "total_pnl": round(total_pnl, 2),
+        "average_win": round(sum(wins) / len(wins), 2) if wins else 0.0,
+        "average_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "max_drawdown": round(max_drawdown, 2),
+    }
+
+    buy_turnover = sum(row["entry_price"] * row["quantity"] for row in trades if row["side"] == "BUY")
+    sell_turnover = sum(row["entry_price"] * row["quantity"] for row in trades if row["side"] == "SELL")
+    total_turnover = buy_turnover + sell_turnover
+
+    pnl_summary = {
+        "unrealized_pnl": 0.0,
+        "realized_pnl": round(total_pnl, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_percent": round((total_pnl / total_turnover) * 100.0, 2) if total_turnover else 0.0,
+        "buy_turnover": round(buy_turnover, 2),
+        "sell_turnover": round(sell_turnover, 2),
+        "total_turnover": round(total_turnover, 2),
+        "total_position_value": 0.0,
+        "open_position_count": 0,
+    }
+
+    return {
+        "simulated": True,
+        "open_positions": [],
+        "history": history,
+        "stats": stats,
+        "pnl_summary": pnl_summary,
     }
 
 

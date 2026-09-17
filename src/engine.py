@@ -25,10 +25,17 @@ from src.option_chain import (
     parse_option_chain,
 )
 from src.paper_trading import PaperPosition, PaperTradeConfig, PaperTradingEngine
-from src.persistence import PersistenceStore
+from src.persistence import PersistenceStore, ensure_seeded
 from src.price_calculator import get_calculator
 from src.rrg import RRGCalculator, RRGConfig
+from src.serializers import (
+    _empty_paper_stats,
+    _empty_pnl_summary,
+    serialize_persisted_candle,
+    summarize_persisted_paper_trades,
+)
 from src.tick_validation import get_market_session_status, validate_tick
+from src.timeutil import now_ist, to_ist, today_ist, trading_date_str
 
 
 def build_data_source(cfg: dict):
@@ -158,7 +165,17 @@ class MarketEngine:
         )
         self._last_chain_persist_at: datetime | None = None
         if persistence_cfg.get("enabled", False):
-            self._persistence = PersistenceStore(persistence_cfg.get("db_path", "data/market_data.db"))
+            db_path = persistence_cfg.get("db_path", "data/market_data.db")
+            # Restore a committed seed of historical MOCK data if db_path
+            # doesn't exist yet (e.g. a fresh Railway container with no
+            # persistent disk) — no-op if db_path already has data (always
+            # true on localhost) or no seed is configured. See
+            # ensure_seeded()'s docstring for the full why.
+            try:
+                ensure_seeded(db_path, persistence_cfg.get("seed_db_path"))
+            except Exception as e:
+                self._logger.log_error(e, {"context": "persistence_seed"})
+            self._persistence = PersistenceStore(db_path)
 
         # RLock, not Lock: _build_snapshot() calls get_settings(), which
         # re-acquires this same lock from the thread that already holds it
@@ -230,6 +247,116 @@ class MarketEngine:
         with self._lock:
             return self._build_snapshot(completed=[])
 
+    # -- Historical Date/Session selector -------------------------------
+    # Everything below is read-only and additive: it only reads back what
+    # the live pipeline above already persists, grouped by Asia/Kolkata
+    # trading date (see src/timeutil.py). None of it touches live state.
+
+    def get_persisted_strike_candles_for_date(self, strike: float, trading_date: str) -> dict | None:
+        """CE/PE/Straddle OHLC candles for one strike on one past trading
+        date — the historical counterpart of get_strike_straddle_candles(),
+        used when switching strikes within an already-selected historical
+        session without recomputing the whole session bundle."""
+        if self._persistence is None:
+            return None
+        by_interval = self._persistence.get_strike_candles_for_date(strike, self.intervals, trading_date)
+        if not any(rows for legs in by_interval.values() for rows in legs.values()):
+            return None
+        return {
+            "strike": strike,
+            "by_interval": {
+                interval: {leg: [serialize_persisted_candle(r) for r in rows] for leg, rows in legs.items()}
+                for interval, legs in by_interval.items()
+            },
+        }
+
+    def get_available_trading_dates(self) -> dict:
+        """Every trading date with persisted data (newest first), plus
+        today's Asia/Kolkata date — backs the Date/Session selector's
+        Previous/Next/date-picker navigation and lets the frontend tell
+        'today, still live' apart from 'a past session, read-only'."""
+        dates = self._persistence.list_trading_dates(self.underlying) if self._persistence else []
+        return {"dates": dates, "today": today_ist().isoformat()}
+
+    def get_historical_session(self, trading_date: str, strike: float | None = None) -> dict:
+        """A read-only bundle for one past Asia/Kolkata trading date: candles
+        (every configured interval), option chain snapshots through the day,
+        one strike's CE/PE/Straddle candles (ATM-at-close if `strike` is
+        omitted), and that day's paper trading history/P&L. Empty/zeroed
+        sub-sections (not an error) if persistence is off or nothing was
+        recorded for this date — see `has_data`."""
+        if self._persistence is None:
+            return {
+                "trading_date": trading_date,
+                "has_data": False,
+                "underlying": {"symbol": self.underlying},
+                "candles": {},
+                "option_chain_snapshots": [],
+                "available_strikes": [],
+                "straddle_candles": None,
+                "paper_trading": {"history": [], "stats": _empty_paper_stats(), "pnl_summary": _empty_pnl_summary()},
+            }
+
+        candles = {
+            str(interval): [
+                serialize_persisted_candle(row)
+                for row in self._persistence.get_candles_for_date(self.underlying, interval, trading_date)
+            ]
+            for interval in self.intervals
+        }
+        chain_snapshots = self._persistence.get_option_chain_snapshots_for_date(self.underlying, trading_date)
+        # Defense in depth: normalize each row's timestamp to an IST-offset
+        # ISO string here too, not just at write time — a DB written before
+        # this normalization existed could still hold offset-less strings.
+        for row in chain_snapshots:
+            if row.get("timestamp"):
+                row["timestamp"] = to_ist(datetime.fromisoformat(row["timestamp"])).isoformat()
+        available_strikes = self._persistence.list_strikes_for_date(trading_date)
+
+        last_snapshot = chain_snapshots[-1] if chain_snapshots else None
+        focus_strike = strike
+        if focus_strike is None and last_snapshot is not None:
+            focus_strike = last_snapshot.get("atm_strike")
+        if focus_strike is None and available_strikes:
+            focus_strike = available_strikes[len(available_strikes) // 2]
+
+        straddle_candles = None
+        if focus_strike is not None:
+            by_interval = self._persistence.get_strike_candles_for_date(
+                float(focus_strike), self.intervals, trading_date
+            )
+            straddle_candles = {
+                "strike": float(focus_strike),
+                "by_interval": {
+                    interval: {leg: [serialize_persisted_candle(r) for r in rows] for leg, rows in legs.items()}
+                    for interval, legs in by_interval.items()
+                },
+            }
+
+        trades = self._persistence.get_paper_trades_for_date(trading_date)
+        paper_trading = summarize_persisted_paper_trades(trades)
+
+        has_data = bool(candles.get(str(self.intervals[0])) or chain_snapshots or trades)
+        underlying_prices = [row["underlying_ltp"] for row in chain_snapshots if row.get("underlying_ltp") is not None]
+
+        return {
+            "trading_date": trading_date,
+            "has_data": has_data,
+            "underlying": {
+                "symbol": self.underlying,
+                "open": underlying_prices[0] if underlying_prices else None,
+                "high": max(underlying_prices) if underlying_prices else None,
+                "low": min(underlying_prices) if underlying_prices else None,
+                "close": underlying_prices[-1] if underlying_prices else None,
+                "last_updated": last_snapshot["timestamp"] if last_snapshot else None,
+            },
+            "candles": candles,
+            "option_chain_snapshots": chain_snapshots,
+            "available_strikes": available_strikes,
+            "straddle_candles": straddle_candles,
+            "paper_trading": paper_trading,
+        }
+
     # -- Paper trading (simulation only, never a real order) ----------------
 
     def _current_leg_price(self, option_type: str, strike: float):
@@ -261,13 +388,13 @@ class MarketEngine:
             price = self._current_leg_price(option_type, strike)
             if price is None:
                 raise ValueError(f"Strike {strike} not found in the current option chain.")
-            timestamp = tick.timestamp if tick else datetime.now()
+            timestamp = tick.timestamp if tick else now_ist()
         return self._paper_trading.open_position(option_type, strike, quantity, price, timestamp, side=side)
 
     def close_paper_position(self, position_id: str) -> PaperPosition | None:
         with self._lock:
             tick = self._latest_tick
-            timestamp = tick.timestamp if tick else datetime.now()
+            timestamp = tick.timestamp if tick else now_ist()
             open_positions = {p.id: p for p in self._paper_trading.get_open_positions()}
             position = open_positions.get(position_id)
             if position is None:
@@ -275,7 +402,20 @@ class MarketEngine:
             price = self._current_leg_price(position.option_type, position.strike)
             if price is None:
                 price = position.current_price
-        return self._paper_trading.close_position(position_id, price, timestamp, reason="MANUAL")
+        closed = self._paper_trading.close_position(position_id, price, timestamp, reason="MANUAL")
+        if closed is not None:
+            self._persist_paper_trade(closed)
+        return closed
+
+    def _persist_paper_trade(self, position: PaperPosition) -> None:
+        """Persist a just-closed simulated position for the historical Date/
+        Session selector's Paper Trading tab. No-op if persistence is off."""
+        if self._persistence is None:
+            return
+        try:
+            self._persistence.save_paper_trade(position)
+        except Exception as e:
+            self._logger.log_error(e, {"context": "persistence_write_paper_trade"})
 
     def set_paper_config(
         self,
@@ -501,6 +641,7 @@ class MarketEngine:
                                     "simulated": True,
                                 },
                             )
+                            self._persist_paper_trade(pos)
                     except Exception as e:
                         self._logger.log_error(e, {"context": "paper_trading_update"})
 
@@ -516,16 +657,21 @@ class MarketEngine:
                                 volume=tick.volume,
                             )
                     completed = self._aggregator.process_tick(candle_tick)
-                    self._strike_candle_engine.process(chain, tick.timestamp)
+                    completed_strike_candles = self._strike_candle_engine.process(chain, tick.timestamp)
 
                     # Log completed candles
                     for candle in completed:
                         self._logger.log_candle_completed(candle)
 
                     # Persist (optional — see `persistence.enabled` in config).
+                    # Every write here is additionally grouped by its
+                    # Asia/Kolkata trading date (see src/timeutil.py), which
+                    # is what backs the historical Date/Session selector.
                     if self._persistence is not None:
                         try:
                             for candle in completed:
+                                self._persistence.save_candle(candle)
+                            for candle in completed_strike_candles:
                                 self._persistence.save_candle(candle)
                             if chain is not None and (
                                 self._last_chain_persist_at is None

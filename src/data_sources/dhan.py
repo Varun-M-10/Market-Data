@@ -15,6 +15,7 @@ from dhanhq.marketfeed import DhanFeed, IDX, Ticker, Quote, Full
 from src.data_sources.base import DataSource
 from src.models import PriceTick
 from src.logging import get_logger
+from src.timeutil import now_ist
 
 
 from pathlib import Path
@@ -266,7 +267,7 @@ class DhanMarketDataProvider(DataSource):
                 "records": {
                     "underlyingValue": float(underlying_ltp),
                     "expiryDates": [self._current_expiry] if self._current_expiry else [],
-                    "timestamp": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+                    "timestamp": now_ist().strftime("%d-%b-%Y %H:%M:%S"),
                     "data": strikes,
                 }
             }
@@ -382,7 +383,7 @@ class DhanMarketDataProvider(DataSource):
                                 price = float(ltp_val)
                                 sec_id = str(data.get("security_id", self.NIFTY_SECURITY_ID))
                                 ltt = str(data.get("LTT", ""))
-                                tick_ts = datetime.now()
+                                tick_ts = now_ist()
                                 
                                 tick = PriceTick(
                                     symbol=self.underlying,

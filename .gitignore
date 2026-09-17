@@ -2,6 +2,17 @@ __pycache__/
 *.pyc
 .venv/
 .env
-data/
+data/*
 *.db
 .pytest_cache/
+
+# Exception: a committed seed copy of historical MOCK data ships with the
+# deploy so Railway's ephemeral filesystem (no volume mounted) has previous
+# trading sessions available immediately after every deploy/restart, not
+# just live data generated after boot. See src/persistence.py::ensure_seeded()
+# and MarketEngine's persistence setup in src/engine.py. Never the live/local
+# runtime DB (data/market_data.db itself stays ignored via the "data/*" rule
+# above — this only re-includes the one seed file below it).
+!data/seed/
+data/seed/*
+!data/seed/market_data.seed.db

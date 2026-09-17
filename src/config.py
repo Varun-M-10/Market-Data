@@ -102,6 +102,15 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     persistence_cfg["db_path"] = os.getenv(
         "PERSISTENCE_DB_PATH", persistence_cfg.get("db_path", "data/market_data.db")
     )
+    # Committed seed copy of historical MOCK data, restored into `db_path` on
+    # startup only if `db_path` doesn't exist yet (e.g. a fresh ephemeral
+    # container on a host with no persistent disk) — see
+    # src/persistence.py::ensure_seeded(). Never touches an already-existing
+    # db_path (localhost's own accumulated history is left alone). Set to a
+    # blank/empty value to disable seeding entirely.
+    persistence_cfg["seed_db_path"] = os.getenv(
+        "PERSISTENCE_SEED_DB_PATH", persistence_cfg.get("seed_db_path", "data/seed/market_data.seed.db")
+    )
     persistence_cfg["option_chain_snapshot_interval_seconds"] = float(
         os.getenv(
             "PERSISTENCE_CHAIN_INTERVAL_SECONDS",

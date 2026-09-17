@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from src.models import ATMResult, OptionChainSnapshot, OptionLeg
+from src.timeutil import now_ist
 
 
 def parse_option_chain(raw: dict, underlying: str) -> OptionChainSnapshot:
@@ -35,7 +36,7 @@ def parse_option_chain(raw: dict, underlying: str) -> OptionChainSnapshot:
     try:
         ts = datetime.strptime(timestamp_str, "%d-%b-%Y %H:%M:%S")
     except ValueError:
-        ts = datetime.now()
+        ts = now_ist()
 
     return OptionChainSnapshot(
         underlying=underlying,

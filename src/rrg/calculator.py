@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.models import OptionChainSnapshot, PriceTick
 from src.rrg.models import RRGConfig, RRGDataPoint, RRGQuadrant, RRGSnapshot
+from src.timeutil import now_ist
 
 
 class RRGCalculator:
@@ -87,7 +88,7 @@ class RRGCalculator:
             benchmark_symbol=self.config.benchmark_symbol,
             benchmark_ltp=self._latest_benchmark_ltp,
             timeframe=self.config.timeframe,
-            timestamp=self._latest_timestamp or datetime.now(),
+            timestamp=self._latest_timestamp or now_ist(),
             data_points=data_points,
         )
 
@@ -135,7 +136,7 @@ class RRGCalculator:
                 rs_ratio=rs_ratio,
                 rs_momentum=rs_momentum,
                 quadrant=quadrant,
-                timestamp=self._latest_timestamp or datetime.now(),
+                timestamp=self._latest_timestamp or now_ist(),
                 option_ltp=option_ltp,
                 benchmark_ltp=benchmark_ltp,
             )

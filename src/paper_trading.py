@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Optional
 
 from src.models import OptionChainSnapshot
+from src.timeutil import to_ist
 
 VALID_OPTION_TYPES = ("CE", "PE")
 VALID_SIDES = ("BUY", "SELL")
@@ -160,8 +161,8 @@ class PaperPosition:
             "position_value": round(position_value, 2),
             "buy_value": round(buy_value, 2),
             "sell_value": round(sell_value, 2),
-            "entry_time": self.entry_time.isoformat() if self.entry_time else None,
-            "exit_time": self.exit_time.isoformat() if self.exit_time else None,
+            "entry_time": to_ist(self.entry_time).isoformat() if self.entry_time else None,
+            "exit_time": to_ist(self.exit_time).isoformat() if self.exit_time else None,
             "exit_price": round(self.exit_price, 2) if self.exit_price is not None else None,
             "exit_reason": self.exit_reason,
             "status": self.status,

@@ -7,6 +7,7 @@ import requests
 
 from src.data_sources.base import DataSource
 from src.models import PriceTick
+from src.timeutil import now_ist
 
 NSE_HEADERS = {
     "User-Agent": (
@@ -77,6 +78,6 @@ class NSEDataSource(DataSource):
             try:
                 ts = datetime.strptime(ts_raw, "%d-%b-%Y %H:%M:%S")
             except ValueError:
-                ts = datetime.now()
+                ts = now_ist()
             yield PriceTick(symbol=self.underlying, price=spot, timestamp=ts)
             time.sleep(self.poll_interval)
