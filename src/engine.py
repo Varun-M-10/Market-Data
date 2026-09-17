@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+import threading
+from datetime import datetime
+from typing import Callable
+
+from src.candles import CandleAggregator
+from src.config import load_config
+from src.data_quality import compute_staleness, default_stale_threshold_seconds
+from src.data_sources import (
+    MockDataSource,
+    NSEDataSource,
+    DhanMarketDataProvider,
+    DhanDataSource,
+    ReplayDataSource,
+    REPLAY_SEQUENCES,
+)
+from src.data_sources.replay import DEFAULT_SEQUENCE
+from src.logging import get_logger
+from src.models import ATMResult, Candle, OptionChainSnapshot, PriceTick
+from src.option_chain import (
+    StrikeStraddleCandleEngine,
+    find_atm_strike,
+    find_atm_strike_delta,
+    parse_option_chain,
+)
+from src.paper_trading import PaperPosition, PaperTradeConfig, PaperTradingEngine
+from src.persistence import PersistenceStore
+from src.price_calculator import get_calculator
+from src.rrg import RRGCalculator, RRGConfig
+from src.tick_validation import get_market_session_status, validate_tick
+
+
+def build_data_source(cfg: dict):
+    underlying = cfg.get("underlying", "NIFTY")
+    poll = float(cfg.get("poll_interval_seconds", 5))
+    if poll <= 0:
+        raise ValueError("poll_interval_seconds must be greater than zero.")
+    source = cfg.get("data_source", "mock").lower()
+
+    if source == "nse":
+        return NSEDataSource(underlying=underlying, poll_interval=poll)
+    if source == "mock":
+        return MockDataSource(
+            underlying=underlying,
+            poll_interval=poll,
+            timezone=cfg.get("timezone", "Asia/Kolkata"),
+            expiry=cfg.get("expiry"),
+        )
+    if source == "dhan":
+        return DhanDataSource(underlying=underlying, poll_interval=poll)
+    if source == "replay":
+        return ReplayDataSource(
+            underlying=underlying,
+            poll_interval=poll,
+            timezone=cfg.get("timezone", "Asia/Kolkata"),
+            sequence=cfg.get("replay_sequence", DEFAULT_SEQUENCE),
+            speed=float(cfg.get("replay_speed", 1.0)),
+            expiry=cfg.get("expiry"),
+        )
+    raise ValueError(f"Unknown data_source: {source!r}. Use 'nse', 'mock', 'dhan', or 'replay'.")
+
+
+UpdateCallback = Callable[[dict], None]
+
+
+class MarketEngine:
+    """Runs the market data loop and exposes thread-safe snapshots."""
+
+    def __init__(self, cfg: dict | None = None):
+        self.cfg = cfg or load_config()
+        self.underlying = self.cfg.get("underlying", "NIFTY")
+        self.intervals = self.cfg.get("candle_intervals", [1, 5, 15])
+        self.price_calc_method = self.cfg.get("price_calculator", "mock")
+        self.log_level = self.cfg.get("log_level", "INFO")
+        self.poll_interval = float(self.cfg.get("poll_interval_seconds", 5))
+        self.stale_threshold_seconds = float(
+            self.cfg.get(
+                "stale_threshold_seconds", default_stale_threshold_seconds(self.poll_interval)
+            )
+        )
+        # ATM selection: "delta" (Greeks-based, default) or "price" (nearest to spot).
+        # Falls back to price-based automatically if a chain carries no Greeks.
+        self.atm_method = str(self.cfg.get("atm_method", "delta")).lower()
+        self.delta_threshold = float(self.cfg.get("delta_threshold", 0.5))
+        self.session_start = self.cfg.get("session_start", "09:15")
+        self.session_end = self.cfg.get("session_end", "15:30")
+        # Which price feeds the candle aggregator/chart: "underlying" (spot,
+        # default) or "combined_value" (ATM Call LTP + Put LTP). Pure display
+        # choice — the CE+PE formula itself lives in the price calculator.
+        self.candle_price_basis = str(self.cfg.get("candle_price_basis", "underlying")).lower()
+
+        self._source = build_data_source(self.cfg)
+        self._aggregator = CandleAggregator(
+            symbol=self.underlying,
+            intervals_minutes=self.intervals,
+            timezone=self.cfg.get("timezone", "Asia/Kolkata"),
+            session_start=self.session_start,
+        )
+        # Per-strike CE/PE/Straddle OHLC candles — any strike in the option
+        # chain, not just ATM. Backs the ATM Straddle Chart's candlestick
+        # view; a strike's series is fixed to that strike by construction
+        # (see StrikeStraddleCandleEngine), so switching strikes in the UI
+        # is just switching which strike's already-tracked series is read.
+        self._strike_candle_engine = StrikeStraddleCandleEngine(
+            intervals_minutes=self.intervals,
+            timezone=self.cfg.get("timezone", "Asia/Kolkata"),
+            session_start=self.session_start,
+        )
+        self._price_calculator = get_calculator(self.price_calc_method)
+        self._logger = get_logger(self.log_level)
+        
+        self._logger.log_system_event(
+            "provider_selected",
+            {
+                "provider": self.cfg.get("data_source", "mock"),
+                "underlying": self.underlying,
+                "provider_class": self._source.__class__.__name__
+            }
+        )
+
+        # Initialize RRG calculator if enabled
+        self._rrg_calculator = None
+        if self.cfg.get("enable_rrg", False):
+            rrg_config = RRGConfig(
+                benchmark_symbol=self.underlying,
+                timeframe=self.cfg.get("rrg_timeframe", "1min"),
+                rolling_window=self.cfg.get("rrg_rolling_window", 14),
+                momentum_period=self.cfg.get("rrg_momentum_period", 1),
+                option_strikes=self.cfg.get("rrg_strikes"),
+                expiry=self.cfg.get("rrg_expiry"),
+            )
+            self._rrg_calculator = RRGCalculator(rrg_config)
+
+        # Paper trading (simulation-only) position engine. Configurable TP/SL,
+        # defaults to TP=10%, SL=5% until overridden via config or the API.
+        # take_profit_amount/stop_loss_amount (₹) are an additional, optional
+        # trigger — None/unset (the default) leaves behavior exactly as
+        # before; never hard-coded (see src/paper_trading.py::PaperTradeConfig).
+        paper_cfg = self.cfg.get("paper_trading", {}) or {}
+        tp_amount = paper_cfg.get("take_profit_amount")
+        sl_amount = paper_cfg.get("stop_loss_amount")
+        self._paper_trading = PaperTradingEngine(
+            PaperTradeConfig(
+                take_profit_percent=float(paper_cfg.get("take_profit_percent", 10.0)),
+                stop_loss_percent=float(paper_cfg.get("stop_loss_percent", 5.0)),
+                take_profit_amount=float(tp_amount) if tp_amount is not None else None,
+                stop_loss_amount=float(sl_amount) if sl_amount is not None else None,
+            )
+        )
+
+        # Persistence (SQLite) for completed candles and option chain/ATM snapshots.
+        # Purely additive: candle/ATM logic has no dependency on this being enabled.
+        persistence_cfg = self.cfg.get("persistence", {}) or {}
+        self._persistence: PersistenceStore | None = None
+        self._chain_persist_interval = float(
+            persistence_cfg.get("option_chain_snapshot_interval_seconds", 5)
+        )
+        self._last_chain_persist_at: datetime | None = None
+        if persistence_cfg.get("enabled", False):
+            self._persistence = PersistenceStore(persistence_cfg.get("db_path", "data/market_data.db"))
+
+        # RLock, not Lock: _build_snapshot() calls get_settings(), which
+        # re-acquires this same lock from the thread that already holds it
+        # (both the tick worker's per-tick block and get_snapshot()).
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._worker_error: Exception | None = None
+        self._subscribers: list[UpdateCallback] = []
+
+        self._latest_tick: PriceTick | None = None
+        self._latest_atm: ATMResult | None = None
+        self._latest_chain: OptionChainSnapshot | None = None
+        self._latest_calculated_prices: dict | None = None
+        self._latest_rrg_snapshot = None
+        self._latest_market_session: str | None = None
+        self._tick_count = 0
+
+        # Reliability: timestamp validation (duplicate/out-of-order rejection).
+        self._last_accepted_timestamp: datetime | None = None
+        self._duplicate_tick_count = 0
+        self._rejected_tick_count = 0
+
+    @property
+    def is_running(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
+    def subscribe(self, callback: UpdateCallback) -> None:
+        self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: UpdateCallback) -> None:
+        if callback in self._subscribers:
+            self._subscribers.remove(callback)
+
+    def start(self) -> None:
+        if self.is_running:
+            return
+        self._stop_event.clear()
+        self._worker_error = None
+        self._worker = threading.Thread(target=self._tick_worker, daemon=True)
+        self._worker.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2)
+            self._worker = None
+
+    def close(self) -> None:
+        """Release resources (persistence DB handle). Safe to call after stop()."""
+        self.stop()
+        if self._persistence is not None:
+            self._persistence.close()
+            self._persistence = None
+
+    def get_persisted_candles(self, interval_minutes: int, limit: int = 200) -> list[dict]:
+        """Completed candles read back from the persistence store (empty if disabled)."""
+        if self._persistence is None:
+            return []
+        return self._persistence.get_recent_candles(self.underlying, interval_minutes, limit)
+
+    def get_persisted_option_chain_snapshots(self, limit: int = 200) -> list[dict]:
+        """Recent option chain/ATM snapshots read back from the persistence store."""
+        if self._persistence is None:
+            return []
+        return self._persistence.get_recent_option_chain_snapshots(self.underlying, limit)
+
+    def get_snapshot(self) -> dict:
+        with self._lock:
+            return self._build_snapshot(completed=[])
+
+    # -- Paper trading (simulation only, never a real order) ----------------
+
+    def _current_leg_price(self, option_type: str, strike: float):
+        """Look up the current CE/PE premium for `strike` from the latest chain."""
+        chain = self._latest_chain
+        if chain is None:
+            return None
+        for leg in chain.strikes:
+            if leg.strike == strike:
+                return leg.call_ltp if option_type.upper() == "CE" else leg.put_ltp
+        return None
+
+    def open_paper_position(
+        self,
+        option_type: str,
+        strike: float | None = None,
+        quantity: int = 50,
+        side: str = "BUY",
+    ) -> PaperPosition:
+        with self._lock:
+            atm = self._latest_atm
+            tick = self._latest_tick
+            if strike is None:
+                # Defensive fallback only — the UI always sends the strike
+                # explicitly from the selected Option Chain contract.
+                if atm is None:
+                    raise ValueError("ATM strike not available yet; cannot open a paper position.")
+                strike = atm.strike
+            price = self._current_leg_price(option_type, strike)
+            if price is None:
+                raise ValueError(f"Strike {strike} not found in the current option chain.")
+            timestamp = tick.timestamp if tick else datetime.now()
+        return self._paper_trading.open_position(option_type, strike, quantity, price, timestamp, side=side)
+
+    def close_paper_position(self, position_id: str) -> PaperPosition | None:
+        with self._lock:
+            tick = self._latest_tick
+            timestamp = tick.timestamp if tick else datetime.now()
+            open_positions = {p.id: p for p in self._paper_trading.get_open_positions()}
+            position = open_positions.get(position_id)
+            if position is None:
+                return None
+            price = self._current_leg_price(position.option_type, position.strike)
+            if price is None:
+                price = position.current_price
+        return self._paper_trading.close_position(position_id, price, timestamp, reason="MANUAL")
+
+    def set_paper_config(
+        self,
+        take_profit_percent: float | None = None,
+        stop_loss_percent: float | None = None,
+        take_profit_amount: float | None = None,
+        stop_loss_amount: float | None = None,
+    ) -> PaperTradeConfig:
+        return self._paper_trading.set_config(
+            take_profit_percent, stop_loss_percent, take_profit_amount, stop_loss_amount
+        )
+
+    def get_paper_state(self) -> dict:
+        return self._paper_trading.to_state_dict()
+
+    # -- Settings / logs / runtime reconfiguration ---------------------------
+
+    def get_recent_logs(self, limit: int = 200, level: str | None = None) -> list[dict]:
+        """Recent structured log entries (in-memory ring buffer), newest first."""
+        return self._logger.get_recent(limit, level)
+
+    def get_settings(self) -> dict:
+        """Current runtime-adjustable settings for the Settings tab."""
+        with self._lock:
+            source = self._source
+            chain = self._latest_chain
+            data_source = str(self.cfg.get("data_source", "mock")).lower()
+            expiry = chain.expiry if chain is not None else getattr(source, "expiry", None)
+            replay_sequence = getattr(source, "sequence_name", DEFAULT_SEQUENCE)
+            replay_speed = getattr(source, "speed", 1.0)
+            atm_method = self.atm_method
+            delta_threshold = self.delta_threshold
+            candle_price_basis = self.candle_price_basis
+        paper_cfg = self._paper_trading.get_config()
+        return {
+            "data_source": data_source,
+            "expiry": expiry,
+            "atm_method": atm_method,
+            "delta_threshold": delta_threshold,
+            "take_profit_percent": paper_cfg.take_profit_percent,
+            "stop_loss_percent": paper_cfg.stop_loss_percent,
+            "candle_price_basis": candle_price_basis,
+            "replay": {
+                "available_sequences": sorted(REPLAY_SEQUENCES.keys()),
+                "sequence": replay_sequence,
+                "speed": replay_speed,
+            },
+        }
+
+    def set_atm_config(self, atm_method: str | None, delta_threshold: float | None) -> dict:
+        """Update the ATM selection method ("delta" or "price") and/or the
+        Delta-closest-to threshold. Either argument may be omitted (None) to
+        leave it unchanged."""
+        if atm_method is not None:
+            atm_method = str(atm_method).lower()
+            if atm_method not in ("delta", "price"):
+                raise ValueError(f"Unknown atm_method: {atm_method!r}. Use 'delta' or 'price'.")
+        if delta_threshold is not None:
+            if not (0 < delta_threshold < 1):
+                raise ValueError("delta_threshold must be between 0 and 1 (exclusive).")
+        with self._lock:
+            if atm_method is not None:
+                self.atm_method = atm_method
+            if delta_threshold is not None:
+                self.delta_threshold = float(delta_threshold)
+        return self.get_settings()
+
+    def set_candle_price_basis(self, candle_price_basis: str) -> dict:
+        """Switch which price feeds the candle aggregator/chart: "underlying"
+        (spot) or "combined_value" (ATM Call LTP + Put LTP). Pure display
+        choice — never touches the CE+PE formula itself."""
+        basis = str(candle_price_basis).lower()
+        if basis not in ("underlying", "combined_value"):
+            raise ValueError(
+                f"Unknown candle_price_basis: {candle_price_basis!r}. "
+                "Use 'underlying' or 'combined_value'."
+            )
+        with self._lock:
+            self.candle_price_basis = basis
+        return self.get_settings()
+
+    def reconfigure_source(
+        self, data_source: str, sequence: str | None = None, speed: float | None = None
+    ) -> dict:
+        """Switch the live feed (e.g. into deterministic MOCK Replay/Test
+        Mode) without losing candle/paper-trading state — only the worker
+        thread and `self._source` are replaced; the aggregator, paper
+        trading engine, and persisted history all live on `self` and are
+        untouched."""
+        source_name = str(data_source).lower()
+        if source_name not in ("mock", "nse", "dhan", "replay"):
+            raise ValueError(
+                f"Unknown data_source: {data_source!r}. Use 'mock', 'nse', 'dhan', or 'replay'."
+            )
+        new_cfg = dict(self.cfg)
+        new_cfg["data_source"] = source_name
+        if sequence is not None:
+            new_cfg["replay_sequence"] = sequence
+        if speed is not None:
+            new_cfg["replay_speed"] = speed
+        new_source = build_data_source(new_cfg)
+
+        was_running = self.is_running
+        if was_running:
+            self.stop()
+        old_source = self._source
+        with self._lock:
+            self._source = new_source
+            self.cfg = new_cfg
+        disconnect = getattr(old_source, "disconnect", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+            except Exception as exc:
+                self._logger.log_error(exc, {"context": "data_source_disconnect"})
+        self._logger.log_system_event(
+            "data_source_reconfigured",
+            {"data_source": source_name, "provider_class": new_source.__class__.__name__},
+        )
+        if was_running:
+            self.start()
+        return self.get_settings()
+
+    def _tick_worker(self) -> None:
+        try:
+            self._logger.log_system_event("engine_started", {"underlying": self.underlying})
+            
+            for tick in self._source.stream_ticks():
+                if self._stop_event.is_set():
+                    break
+
+                # Reliability gate: reject a missing/invalid timestamp, an
+                # exact-duplicate re-delivery, or an out-of-order tick before
+                # it can reach the candle aggregator (see src/tick_validation.py).
+                validation = validate_tick(tick, self._last_accepted_timestamp)
+                if not validation.is_valid:
+                    with self._lock:
+                        if validation.is_duplicate:
+                            self._duplicate_tick_count += 1
+                        else:
+                            self._rejected_tick_count += 1
+                    self._logger.log_system_event(
+                        "tick_rejected",
+                        {"reason": validation.reason, "timestamp": str(tick.timestamp if tick else None)},
+                    )
+                    continue
+                self._last_accepted_timestamp = tick.timestamp
+                self._latest_market_session = get_market_session_status(
+                    tick.timestamp,
+                    session_start=self.session_start,
+                    session_end=self.session_end,
+                    timezone=self.cfg.get("timezone", "Asia/Kolkata"),
+                )
+
+                # Log incoming price tick
+                self._logger.log_price_tick(tick, {"source": self.cfg.get("data_source", "mock")})
+
+                try:
+                    raw = self._source.fetch_option_chain()
+                    chain = parse_option_chain(raw, self.underlying)
+
+                    # ATM selection: Delta-based (Greeks, default) with automatic
+                    # fallback to price-based if the chain carries no Greeks;
+                    # "price" mode uses price-based directly. Either way, the
+                    # price-based strike is attached for on-screen comparison.
+                    price_atm = find_atm_strike(chain)
+                    if self.atm_method == "delta":
+                        atm = find_atm_strike_delta(chain, delta_threshold=self.delta_threshold)
+                        if atm is None:
+                            atm = price_atm
+                    else:
+                        atm = price_atm
+                    if atm is not None and atm.price_based_strike is None:
+                        atm.price_based_strike = price_atm.strike if price_atm else None
+
+                    # Log ATM update
+                    if atm:
+                        self._logger.log_atm_update(
+                            {
+                                "strike": atm.strike,
+                                "call_ltp": atm.call_ltp,
+                                "put_ltp": atm.put_ltp,
+                                "straddle_premium": atm.straddle_premium,
+                            }
+                        )
+                except Exception as e:
+                    self._logger.log_error(e, {"context": "option_chain_fetch"})
+                    atm = self._latest_atm
+                    chain = self._latest_chain
+
+                with self._lock:
+                    self._latest_tick = tick
+                    self._latest_atm = atm
+                    self._latest_chain = chain
+                    self._latest_calculated_prices = self._price_calculator.calculate(atm) if atm else None
+                    
+                    # Log calculated prices
+                    if self._latest_calculated_prices:
+                        self._logger.log_calculated_prices(self._latest_calculated_prices)
+                    
+                    # Update RRG calculator if enabled
+                    if self._rrg_calculator and chain:
+                        try:
+                            self._rrg_calculator.update(tick, chain)
+                            self._latest_rrg_snapshot = self._rrg_calculator.calculate_rrg()
+                        except Exception as e:
+                            self._logger.log_error(e, {"context": "rrg_calculation"})
+
+                    # Mark paper (simulated) positions to market and auto-exit
+                    # on TP/SL. Never touches a real order — see paper_trading.py.
+                    try:
+                        paper_exits = self._paper_trading.update(chain, tick.timestamp)
+                        for pos in paper_exits:
+                            self._logger.log_system_event(
+                                "paper_position_exit",
+                                {
+                                    "id": pos.id,
+                                    "option_type": pos.option_type,
+                                    "strike": pos.strike,
+                                    "exit_reason": pos.exit_reason,
+                                    "pnl": pos.pnl,
+                                    "pnl_percent": pos.pnl_percent,
+                                    "simulated": True,
+                                },
+                            )
+                    except Exception as e:
+                        self._logger.log_error(e, {"context": "paper_trading_update"})
+
+                    self._tick_count += 1
+                    candle_tick = tick
+                    if self.candle_price_basis == "combined_value" and self._latest_calculated_prices:
+                        combined_value = self._latest_calculated_prices.get("combined_value")
+                        if combined_value is not None:
+                            candle_tick = PriceTick(
+                                symbol=tick.symbol,
+                                price=combined_value,
+                                timestamp=tick.timestamp,
+                                volume=tick.volume,
+                            )
+                    completed = self._aggregator.process_tick(candle_tick)
+                    self._strike_candle_engine.process(chain, tick.timestamp)
+
+                    # Log completed candles
+                    for candle in completed:
+                        self._logger.log_candle_completed(candle)
+
+                    # Persist (optional — see `persistence.enabled` in config).
+                    if self._persistence is not None:
+                        try:
+                            for candle in completed:
+                                self._persistence.save_candle(candle)
+                            if chain is not None and (
+                                self._last_chain_persist_at is None
+                                or (tick.timestamp - self._last_chain_persist_at).total_seconds()
+                                >= self._chain_persist_interval
+                            ):
+                                self._persistence.save_option_chain_snapshot(chain, atm)
+                                self._last_chain_persist_at = tick.timestamp
+                        except Exception as e:
+                            self._logger.log_error(e, {"context": "persistence_write"})
+
+                    snapshot = self._build_snapshot(completed=completed)
+                    subscribers = list(self._subscribers)
+
+                for callback in subscribers:
+                    try:
+                        callback(snapshot)
+                    except Exception as e:
+                        self._logger.log_error(e, {"context": "subscriber_callback"})
+        except Exception as exc:
+            self._logger.log_error(exc, {"context": "tick_worker"})
+            self._worker_error = exc
+            self._stop_event.set()
+
+    def get_strike_straddle_candles(self, strike: float) -> dict | None:
+        """CE/PE/Straddle OHLC candles for one strike (any strike currently
+        or previously present in the option chain), for the ATM Straddle
+        Chart's candlestick view. None if that strike hasn't been seen yet."""
+        from src.serializers import serialize_strike_candles
+
+        with self._lock:
+            builders = self._strike_candle_engine.get_strike_builders(strike)
+            if builders is None:
+                return None
+            return serialize_strike_candles(strike, builders)
+
+    def _build_snapshot(self, completed: list[Candle]) -> dict:
+        from src.serializers import serialize_snapshot
+        from src.data_sources.dhan import DhanMarketDataProvider
+
+        cfg_source = str(self.cfg.get("data_source", "mock")).lower()
+        if isinstance(self._source, DhanMarketDataProvider):
+            if self._source.has_received_tick:
+                effective_source = "DHAN"
+                status_label = "LIVE"
+            elif self._source.is_connected:
+                effective_source = "DHAN (SUBSCRIBED)"
+                status_label = "CONNECTING"
+            else:
+                effective_source = "DHAN (CONNECTING)"
+                status_label = "OFFLINE"
+        elif cfg_source == "nse":
+            effective_source = "NSE"
+            status_label = "LIVE" if self._latest_tick else "OFFLINE"
+        else:
+            effective_source = cfg_source
+            status_label = "SIMULATED"
+
+        last_tick_age_seconds, is_stale = compute_staleness(
+            self._latest_tick.timestamp if self._latest_tick else None,
+            threshold_seconds=self.stale_threshold_seconds,
+        )
+
+        return serialize_snapshot(
+            duplicate_tick_count=self._duplicate_tick_count,
+            rejected_tick_count=self._rejected_tick_count,
+            market_session=self._latest_market_session,
+            underlying=self.underlying,
+            tick=self._latest_tick,
+            atm=self._latest_atm,
+            chain=self._latest_chain,
+            calculated_prices=self._latest_calculated_prices,
+            rrg_snapshot=self._latest_rrg_snapshot,
+            active_candles=self._aggregator.snapshot_active(),
+            completed_candles=self._aggregator.completed_candles,
+            newly_completed=completed,
+            tick_count=self._tick_count,
+            intervals=self.intervals,
+            data_source=effective_source,
+            status=status_label,
+            paper_trading=self._paper_trading.to_state_dict(),
+            last_tick_age_seconds=last_tick_age_seconds,
+            is_stale=is_stale,
+            stale_threshold_seconds=self.stale_threshold_seconds,
+            persistence_enabled=self._persistence is not None,
+            settings=self.get_settings(),
+        )

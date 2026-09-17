@@ -1,0 +1,79 @@
+# Live Market Data System Configuration
+
+symbol: NIFTY
+# Expiry used by MOCK/Replay data sources: set an explicit "DD-Mon-YYYY"
+# string to pin it, or leave null to auto-compute the next weekly expiry
+# (see src/option_chain/expiry.py) so it's never a stale hard-coded date.
+# Ignored by Dhan, which resolves the real expiry from its own API.
+expiry: null
+
+# Poll interval in seconds (how often fresh prices are fetched)
+poll_interval_seconds: 1
+
+# Candle intervals to generate (minutes)
+candle_intervals:
+  - 1
+  - 5
+  - 15
+
+# Data source: "nse" for live NSE India data, "mock" for simulated ticks, "dhan" for DhanHQ
+data_source: mock
+
+# Timezone & Market Session Configuration
+timezone: "Asia/Kolkata"
+session_start: "09:15"
+session_end: "15:30"
+
+# ATM selection method: "delta" (Greeks-based, default) selects the strike whose
+# Call/Put Delta is closest to `delta_threshold`; falls back to "price" automatically
+# if the chain carries no Greeks. "price" selects nearest strike to spot directly.
+atm_method: delta
+delta_threshold: 0.5
+
+# Underlying index for option chain (NIFTY, BANKNIFTY, FINNIFTY, etc.)
+underlying: NIFTY
+
+# Price calculator method: "mock" (default), "black_scholes", "delta_neutral"
+price_calculator: mock
+
+# Log level: DEBUG, INFO, WARNING, ERROR
+log_level: INFO
+
+# RRG (Relative Rotation Graph) Analytics Configuration
+# RRG tracks relative performance of option strikes against the benchmark
+enable_rrg: false  # Set to true to enable RRG calculations
+
+# RRG analysis parameters
+rrg_timeframe: "1min"  # Timeframe for RRG calculation (1min, 5min, 15min, daily)
+rrg_rolling_window: 14  # Number of periods for rolling statistics
+rrg_momentum_period: 1  # Period for rate of change calculation
+rrg_strikes: null  # Specific strikes to track (null = all strikes)
+rrg_expiry: null  # Expiry to analyze (null = uses current expiry)
+
+# Paper Trading (SIMULATION ONLY — never places real Dhan/broker orders)
+# Positions auto-exit when P&L crosses these thresholds; also configurable at
+# runtime via POST /api/paper/config.
+paper_trading:
+  take_profit_percent: 10.0  # auto-exit when P&L% >= this
+  stop_loss_percent: 5.0     # auto-exit when P&L% <= -this
+  default_quantity: 50       # default lot/unit size when quantity is omitted
+  # ₹ (absolute P&L) Profit Target / Loss Limit — an ADDITIONAL, independent
+  # exit trigger alongside the percent ones above (whichever is hit first
+  # exits the position). Leave commented/null to disable and use percent-only
+  # behavior, as before. Example: take_profit_amount: 500  # exit at +₹500
+  take_profit_amount: null
+  stop_loss_amount: null
+
+# Stale-data detection: the feed is flagged stale if no tick has been
+# received within this many seconds, independent of the connection badge
+# (a source can report "connected" while it has silently stopped sending).
+# Default (if omitted): max(10, poll_interval_seconds * 3).
+stale_threshold_seconds: 10
+
+# Persistence (SQLite, stdlib-only) for completed candles and option
+# chain/ATM snapshots. Purely additive — candle/ATM/paper-trading logic has
+# no dependency on this being enabled, so it is safe to turn off.
+persistence:
+  enabled: true
+  db_path: "data/market_data.db"
+  option_chain_snapshot_interval_seconds: 5  # throttle chain snapshot writes
