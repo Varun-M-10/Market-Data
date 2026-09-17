@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable
 
 from src.candles import CandleAggregator
@@ -35,6 +35,7 @@ from src.serializers import (
     summarize_persisted_paper_trades,
 )
 from src.tick_validation import get_market_session_status, validate_tick
+from src.market_calendar import is_trading_day as is_nse_trading_day
 from src.timeutil import now_ist, to_ist, today_ist, trading_date_str
 
 
@@ -271,11 +272,19 @@ class MarketEngine:
         }
 
     def get_available_trading_dates(self) -> dict:
-        """Every trading date with persisted data (newest first), plus
-        today's Asia/Kolkata date — backs the Date/Session selector's
-        Previous/Next/date-picker navigation and lets the frontend tell
-        'today, still live' apart from 'a past session, read-only'."""
-        dates = self._persistence.list_trading_dates(self.underlying) if self._persistence else []
+        """Every *valid NSE trading day* with persisted data (newest
+        first), plus today's Asia/Kolkata date — backs the Date/Session
+        selector's Previous/Next/date-picker navigation and lets the
+        frontend tell 'today, still live' apart from 'a past session,
+        read-only'.
+
+        Persisted dates are filtered through market_calendar.is_trading_day
+        so a weekend or a known NSE holiday is never offered as a
+        selectable historical session, even if a dev/test run happened to
+        record MOCK ticks on one — selectability is the intersection of
+        "has data" and "is a real trading day", not either alone."""
+        raw_dates = self._persistence.list_trading_dates(self.underlying) if self._persistence else []
+        dates = [d for d in raw_dates if is_nse_trading_day(date.fromisoformat(d))]
         return {"dates": dates, "today": today_ist().isoformat()}
 
     def get_historical_session(self, trading_date: str, strike: float | None = None) -> dict:
@@ -285,7 +294,17 @@ class MarketEngine:
         omitted), and that day's paper trading history/P&L. Empty/zeroed
         sub-sections (not an error) if persistence is off or nothing was
         recorded for this date — see `has_data`."""
-        if self._persistence is None:
+        # A weekend/NSE-holiday date is never a selectable historical
+        # session (see get_available_trading_dates) — reported as "no
+        # data" even if some MOCK data happens to be persisted under it
+        # (e.g. a dev/test run), so a hand-typed ?date= can't surface a
+        # date the Date/Session selector itself would never offer. `today`
+        # is exempt: live MOCK mode runs regardless of the calendar.
+        is_valid_trading_date = trading_date == today_ist().isoformat() or is_nse_trading_day(
+            date.fromisoformat(trading_date)
+        )
+
+        if self._persistence is None or not is_valid_trading_date:
             return {
                 "trading_date": trading_date,
                 "has_data": False,

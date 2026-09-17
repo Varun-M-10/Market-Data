@@ -16,3 +16,7 @@ data/*
 !data/seed/
 data/seed/*
 !data/seed/market_data.seed.db
+
+# Exception: the committed NSE trading-holiday table (plain JSON, not a
+# database) used by src/market_calendar.py — see that module's docstring.
+!data/nse_holidays.json

@@ -12,6 +12,7 @@ from datetime import datetime
 import pytest
 
 from src.engine import MarketEngine
+from src.models import Candle
 from src.timeutil import IST, today_ist
 
 
@@ -120,6 +121,44 @@ def test_historical_session_read_only_snapshot_does_not_move_with_new_ticks(tmp_
         assert second["candles"]["1"][:first_candle_count] == first["candles"]["1"]
     finally:
         engine.close()
+
+
+def test_available_dates_excludes_a_weekend_or_holiday_even_if_data_exists(tmp_path):
+    """The Date/Session selector must never offer a weekend/NSE-holiday
+    date, even if some MOCK data happens to be persisted under it (e.g. a
+    stray dev/test run) — see market_calendar.is_trading_day and its use in
+    get_available_trading_dates()/get_historical_session()."""
+    engine = make_engine(tmp_path)
+    store = engine._persistence
+    # 2026-09-12/13 = Sat/Sun; 2026-09-14 = Ganesh Chaturthi (a Monday NSE
+    # holiday, per data/nse_holidays.json) — all three get MOCK candles
+    # written directly, bypassing the live pipeline's own calendar.
+    for day in (12, 13, 14):
+        store.save_candle(
+            Candle(
+                symbol="NIFTY",
+                interval_minutes=1,
+                open_time=datetime(2026, 9, day, 10, 0, 0, tzinfo=IST),
+                close_time=datetime(2026, 9, day, 10, 1, 0, tzinfo=IST),
+                open=100.0,
+                high=110.0,
+                low=95.0,
+                close=105.0,
+                tick_count=5,
+                is_complete=True,
+            )
+        )
+
+    dates = engine.get_available_trading_dates()["dates"]
+    assert "2026-09-12" not in dates
+    assert "2026-09-13" not in dates
+    assert "2026-09-14" not in dates
+
+    for day in ("2026-09-12", "2026-09-13", "2026-09-14"):
+        session = engine.get_historical_session(day)
+        assert session["has_data"] is False, f"{day} should report no data (weekend/holiday)"
+
+    engine.close()
 
 
 def test_persistence_disabled_returns_empty_dates_and_no_data_session(tmp_path):

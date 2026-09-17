@@ -162,6 +162,7 @@ const els = {
   sessionBar: document.getElementById("session-bar"),
   sessionPrevBtn: document.getElementById("session-prev-btn"),
   sessionDatePicker: document.getElementById("session-date-picker"),
+  sessionDateLabel: document.getElementById("session-date-label"),
   sessionNextBtn: document.getElementById("session-next-btn"),
   sessionTodayBtn: document.getElementById("session-today-btn"),
   sessionModeBadge: document.getElementById("session-mode-badge"),
@@ -1621,12 +1622,27 @@ function setSessionMode(mode) {
   }
 }
 
+// "YYYY-MM-DD" -> "DD-MM-YYYY" by string reordering only — no Date object,
+// so there's no locale/timezone reinterpretation risk (see fmtDate's IST
+// pinning above; this is the same convention applied without ever touching
+// a Date at all, since the source string is already a plain calendar date).
+function fmtDateDDMMYYYY(iso) {
+  if (!iso) return "—";
+  const [y, m, d] = iso.split("-");
+  return `${d}-${m}-${y}`;
+}
+
 function updateSessionNavButtons() {
   const iso = state.selectedDateIso;
   els.sessionPrevBtn.disabled = !iso || previousAvailableDate(iso) == null;
   els.sessionNextBtn.disabled = !iso || nextAvailableDate(iso) == null;
   if (iso) els.sessionDatePicker.value = iso;
   if (state.todayIso) els.sessionDatePicker.max = state.todayIso;
+  if (els.sessionDateLabel) {
+    els.sessionDateLabel.textContent = fmtDateDDMMYYYY(iso);
+    els.sessionDateLabel.title =
+      iso && state.todayIso && iso === state.todayIso ? "Today (live MOCK mode)" : "Historical trading date";
+  }
 }
 
 async function loadAvailableDates() {
@@ -1843,6 +1859,22 @@ function bindSessionBar() {
     await loadAvailableDates();
     selectDate(snapToAvailableDate(event.target.value));
   });
+
+  // Recognize an IST midnight rollover without requiring a page reload:
+  // poll the wall clock (cheap, local — no network) and only re-sync with
+  // the server (new today, refreshed available-dates list, and — if the
+  // user was on "Today" — follow it forward to the new day) once the IST
+  // calendar date actually changes. A user parked on a historical date is
+  // left exactly where they are; only `todayIso`/the picker's max and the
+  // Today button's target move.
+  state.dayRolloverTimer = setInterval(() => {
+    const nowIso = todayIsoIST();
+    if (nowIso === state.todayIso) return;
+    const wasOnToday = state.selectedDateIso === state.todayIso;
+    loadAvailableDates().then(() => {
+      if (wasOnToday) selectDate(state.todayIso);
+    });
+  }, 60_000);
 
   // Switches which persisted strike's CE/PE/Straddle candles the Straddle
   // Chart shows within the already-loaded historical session — a lighter
